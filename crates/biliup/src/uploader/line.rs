@@ -57,14 +57,16 @@ impl Parcel {
         };
 
         if video.title.is_none()
-            && let Some(filename) = self.video_file.filepath.file_stem().and_then(OsStr::to_str) {
-                // B站限制分P视频标题不能超过80字符，需要截断
-                video.title = Some(if filename.chars().count() >= 80 {
-                    Video::truncate_title(filename, 80)
-                } else {
-                    filename.to_string()
-                });
-            };
+            && let Some(filename) = self.video_file.filepath.file_stem().and_then(OsStr::to_str)
+        {
+            video.title = Some(filename.to_string());
+        }
+
+        if let Some(title) = video.title.as_ref()
+            && title.chars().count() > 80
+        {
+            video.title = Some(Video::truncate_title(title, 80));
+        }
         Ok(video)
     }
 }

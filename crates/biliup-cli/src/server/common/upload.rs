@@ -1,12 +1,12 @@
-use crate::UploadLine;
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
 use crate::server::core::downloader::SegmentInfo;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::context::{Context, Stage, Worker, WorkerStatus};
-use crate::server::infrastructure::models::InsertFileItem;
 use crate::server::infrastructure::models::hook_step::process_video;
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
+use crate::server::infrastructure::models::InsertFileItem;
+use crate::UploadLine;
 use async_channel::Receiver;
 use biliup::bilibili::{BiliBili, ResponseData, Studio, Video};
 use biliup::client::StatelessClient;
@@ -14,10 +14,10 @@ use biliup::credential::login_by_cookies;
 use biliup::error::Kind;
 use biliup::uploader::line::{Line, Probe};
 use biliup::uploader::util::SubmitOption;
-use biliup::uploader::{VideoFile, line};
+use biliup::uploader::{line, VideoFile};
 use error_stack::ResultExt;
-use futures::StreamExt;
 use futures::stream::Inspect;
+use futures::StreamExt;
 use ormlite::Insert;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -26,6 +26,8 @@ use tokio::pin;
 use tracing::{error, info};
 
 // 辅助结构体
+const MAX_VIDEOS_PER_SUBMIT: usize = 99;
+
 struct UploadContext {
     bilibili: BiliBili,
     line: Line,
@@ -61,16 +63,31 @@ where
             .recorder(ctx.stream_info_ext().streamer_info.clone())
             .clone();
         recorder.filename_prefix = upload_config.title.clone();
-
-        let studio = build_studio(
-            &upload_config,
-            &upload_context.bilibili,
-            uploaded_videos.videos,
-            &recorder,
-        )
-        .await?;
         let submit_api = ctx.config().submit_api.clone();
-        submit_to_bilibili(&upload_context.bilibili, &studio, submit_api.as_deref()).await?;
+
+        let total_batches = uploaded_videos.videos.len().div_ceil(MAX_VIDEOS_PER_SUBMIT);
+        for (batch_index, videos_chunk) in uploaded_videos
+            .videos
+            .chunks(MAX_VIDEOS_PER_SUBMIT)
+            .enumerate()
+        {
+            let mut studio = build_studio(
+                upload_config,
+                &upload_context.bilibili,
+                videos_chunk.to_vec(),
+                &recorder,
+            )
+            .await?;
+
+            studio.title = add_batch_suffix(&studio.title, batch_index + 1, total_batches);
+            info!(
+                batch_index = batch_index + 1,
+                total_batches,
+                videos = studio.videos.len(),
+                "Submitting video batch"
+            );
+            submit_to_bilibili(&upload_context.bilibili, &studio, submit_api.as_deref()).await?;
+        }
     }
 
     // 4. 执行后处理
@@ -79,6 +96,30 @@ where
     }
 
     Ok(())
+}
+
+fn add_batch_suffix(title: &str, batch_index: usize, total_batches: usize) -> String {
+    if total_batches <= 1 {
+        if title.chars().count() > 80 {
+            return Video::truncate_title(title, 80);
+        }
+        return title.to_string();
+    }
+
+    let suffix = format!(" [{batch_index}/{total_batches}]");
+    let suffix_len = suffix.chars().count();
+
+    if suffix_len >= 80 {
+        return suffix.chars().take(80).collect();
+    }
+
+    let max_title_chars = 80 - suffix_len;
+    let base = if title.chars().count() > max_title_chars {
+        Video::truncate_title(title, max_title_chars)
+    } else {
+        title.to_string()
+    };
+    format!("{base}{suffix}")
 }
 
 async fn initialize_upload_context(
@@ -233,9 +274,24 @@ pub async fn submit_to_bilibili(
 pub(crate) async fn build_studio(
     upload_config: &UploadStreamer,
     bilibili: &BiliBili,
-    videos: Vec<Video>,
+    mut videos: Vec<Video>,
     recorder: &Recorder,
 ) -> AppResult<Studio> {
+    let formatted_title = recorder.format_filename();
+    let studio_title = if formatted_title.chars().count() > 80 {
+        Video::truncate_title(&formatted_title, 80)
+    } else {
+        formatted_title
+    };
+
+    for video in &mut videos {
+        if let Some(title) = video.title.as_ref()
+            && title.chars().count() > 80
+        {
+            video.title = Some(Video::truncate_title(title, 80));
+        }
+    }
+
     // 使用 Builder 模式简化构建
     let mut studio: Studio = Studio::builder()
         .desc(recorder.format(&upload_config.description.clone().unwrap_or_default()))
@@ -251,7 +307,7 @@ pub(crate) async fn build_studio(
         )
         .tag(upload_config.tags.join(","))
         .maybe_tid(upload_config.tid)
-        .title(recorder.format_filename())
+        .title(studio_title)
         .videos(videos)
         .dolby(upload_config.dolby.unwrap_or_default())
         // .lossless_music(upload_config.)
