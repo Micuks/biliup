@@ -101,7 +101,7 @@ class Twitch(DownloadBase, BatchCheck):
             'variables': {'channel_name': channel_name}
         }, self.config)).get('data', {}).get('user')
         if not user:
-            logger.warning(f"{Twitch.__name__}: {self.url}: 获取错误", exc_info=True)
+            logger.warning(f"{Twitch.__name__}: {self.url}: 获取用户信息失败(GQL返回空)")
             return False
         elif not user['stream'] or user['stream']['type'] != 'live':
             return False
@@ -177,7 +177,7 @@ class Twitch(DownloadBase, BatchCheck):
         for index, data in enumerate(gql):
             user = data.get('data', {}).get('user')
             if not user:
-                logger.warning(f"{Twitch.__name__}: {check_urls[index]}: 获取错误")
+                logger.warning(f"{Twitch.__name__}: {check_urls[index]}: 批量检测获取用户信息失败")
                 continue
             elif not user['stream'] or user['stream']['type'] != 'live':
                 continue
@@ -194,7 +194,7 @@ class Twitch(DownloadBase, BatchCheck):
                 self.__proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self.__proc.kill()
-        except:
+        except Exception:
             logger.exception(f'terminate {self.fname} failed')
         finally:
             self.__proc = None
@@ -240,7 +240,8 @@ class TwitchUtils:
         return await TwitchUtils.__post_gql(headers, ops, config)
 
     @staticmethod
-    async def __post_gql(headers, ops, config):
+    async def __post_gql(headers, ops, config, _retry=0):
+        max_retries = 3
         try:
             _resp = await client.post(
                 'https://gql.twitch.tv/gql',
@@ -251,8 +252,19 @@ class TwitchUtils:
             gql = _resp.json()
             if isinstance(gql, dict) and gql.get('error') == 'Unauthorized':
                 TwitchUtils.invalid_auth_token(config)
-                return await TwitchUtils.post_gql(ops, config)
+                if _retry < 1:
+                    return await TwitchUtils.__post_gql(headers, ops, config, _retry=_retry + 1)
+                logger.warning("Twitch: Unauthorized after token refresh, giving up")
+                return {}
             return gql
-        except:
-            logger.exception(f"Twitch - post_gql: {ops}")
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            if _retry < max_retries:
+                import asyncio
+                wait = 2 ** _retry
+                logger.warning(f"Twitch - post_gql retry {_retry + 1}/{max_retries} after {type(e).__name__}: {e}")
+                await asyncio.sleep(wait)
+                return await TwitchUtils.__post_gql(headers, ops, config, _retry=_retry + 1)
+            logger.error(f"Twitch - post_gql failed after {max_retries} retries: {type(e).__name__}: {e}")
         return {}

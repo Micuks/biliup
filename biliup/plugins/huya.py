@@ -58,7 +58,8 @@ class Huya(DownloadBase):
             self.fake_headers['referer'] = self.url
             room_profile = await self.get_room_profile(self.huya_mobile_api)
         except Exception as e:
-            logger.error(f"{self.plugin_msg}: {e}", exc_info=True)
+            err_msg = str(e) or f"{type(e).__name__}"
+            logger.error(f"{self.plugin_msg}: {err_msg}", exc_info=True)
             return False
 
         if not room_profile['live']:
