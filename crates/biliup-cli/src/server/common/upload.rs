@@ -1,5 +1,5 @@
 use crate::UploadLine;
-use crate::server::common::util::Recorder;
+use crate::server::common::util::{FileValidator, Recorder};
 use crate::server::config::Config;
 use crate::server::core::downloader::SegmentInfo;
 use crate::server::errors::{AppError, AppResult};
@@ -241,6 +241,9 @@ async fn pipeline_upload_videos(
 }
 
 async fn upload_single_file(file_path: &Path, context: &UploadContext) -> AppResult<Video> {
+    // A segment may reach upload from a stale queue or external trigger; probe again before submit.
+    FileValidator::new(0, true).validate_media_streams(file_path)?;
+
     let video_path = file_path;
     let UploadContext {
         bilibili,

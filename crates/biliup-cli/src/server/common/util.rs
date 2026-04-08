@@ -5,9 +5,14 @@ use chrono::{Duration, Local};
 use error_stack::{ResultExt, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use tracing::{error, info};
+use std::process::Command;
+use std::sync::OnceLock;
+use tracing::{error, info, warn};
 use url::Url;
+
+static FFPROBE_MISSING_WARNED: OnceLock<()> = OnceLock::new();
 
 /// 录制器配置结构体
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -165,7 +170,9 @@ pub fn parse_time(segment_time: &str) -> std::time::Duration {
 
 #[cfg(test)]
 mod tests {
-    use crate::server::common::util::media_ext_from_url;
+    use crate::server::common::util::{
+        MediaProbeSummary, media_ext_from_url, parse_ffprobe_duration, parse_ffprobe_summary,
+    };
 
     #[test]
     fn it_works() {
@@ -175,6 +182,57 @@ mod tests {
             ),
             Some("flv".to_string())
         );
+    }
+
+    #[test]
+    fn parses_ffprobe_summary_with_video() {
+        let summary = parse_ffprobe_summary(
+            r#"{
+                "streams":[
+                    {"codec_type":"audio"},
+                    {"codec_type":"video"}
+                ],
+                "format":{"duration":"30.123"}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary,
+            MediaProbeSummary {
+                has_video: true,
+                duration: Some(30.123)
+            }
+        );
+    }
+
+    #[test]
+    fn parses_ffprobe_summary_without_video() {
+        let summary = parse_ffprobe_summary(
+            r#"{
+                "streams":[
+                    {"codec_type":"audio"},
+                    {"codec_type":"subtitle"}
+                ],
+                "format":{"duration":"375.942211"}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary,
+            MediaProbeSummary {
+                has_video: false,
+                duration: Some(375.942211)
+            }
+        );
+    }
+
+    #[test]
+    fn parses_ffprobe_duration_handles_na() {
+        assert_eq!(parse_ffprobe_duration("N/A"), None);
+        assert_eq!(parse_ffprobe_duration(""), None);
+        assert_eq!(parse_ffprobe_duration("1.5"), Some(1.5));
     }
 }
 
@@ -233,6 +291,33 @@ impl FileValidator {
             self.validate_format(path)?;
         }
 
+        self.validate_media_streams(path)?;
+
+        Ok(())
+    }
+
+    /// 使用 ffprobe 验证媒体可读性，至少要有一条视频流。
+    pub fn validate_media_streams(&self, path: &Path) -> AppResult<()> {
+        let Some(summary) = probe_media_summary(path)? else {
+            return Ok(());
+        };
+
+        if !summary.has_video {
+            bail!(AppError::Custom(format!(
+                "File {} has no video stream",
+                path.display()
+            )));
+        }
+
+        if let Some(duration) = summary.duration
+            && duration <= 0.0
+        {
+            bail!(AppError::Custom(format!(
+                "File {} has invalid duration reported by ffprobe: {duration}",
+                path.display()
+            )));
+        }
+
         Ok(())
     }
 
@@ -248,4 +333,98 @@ impl FileValidator {
             bail!(AppError::Custom("No file extension found".to_string()))
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct FfprobeOutput {
+    #[serde(default)]
+    streams: Vec<FfprobeStream>,
+    format: Option<FfprobeFormat>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FfprobeStream {
+    codec_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FfprobeFormat {
+    duration: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+struct MediaProbeSummary {
+    has_video: bool,
+    duration: Option<f64>,
+}
+
+fn probe_media_summary(path: &Path) -> AppResult<Option<MediaProbeSummary>> {
+    let output = match Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type:format=duration",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            if FFPROBE_MISSING_WARNED.set(()).is_ok() {
+                warn!("ffprobe not found, skipping media stream validation");
+            }
+            return Ok(None);
+        }
+        Err(err) => {
+            bail!(AppError::Custom(format!(
+                "Failed to spawn ffprobe for {}: {err}",
+                path.display()
+            )))
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("exit status {:?}", output.status.code())
+        } else {
+            stderr
+        };
+        bail!(AppError::Custom(format!(
+            "ffprobe validation failed for {}: {detail}",
+            path.display()
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(Some(parse_ffprobe_summary(&stdout)?))
+}
+
+fn parse_ffprobe_summary(raw: &str) -> AppResult<MediaProbeSummary> {
+    let parsed: FfprobeOutput = serde_json::from_str(raw).change_context(AppError::Unknown)?;
+    let has_video = parsed
+        .streams
+        .iter()
+        .any(|stream| stream.codec_type.as_deref() == Some("video"));
+    let duration = parsed
+        .format
+        .as_ref()
+        .and_then(|format| format.duration.as_deref())
+        .and_then(parse_ffprobe_duration);
+
+    Ok(MediaProbeSummary {
+        has_video,
+        duration,
+    })
+}
+
+fn parse_ffprobe_duration(raw: &str) -> Option<f64> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("n/a") {
+        return None;
+    }
+    raw.parse::<f64>().ok()
 }
