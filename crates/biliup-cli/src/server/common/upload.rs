@@ -1,12 +1,12 @@
+use crate::UploadLine;
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
 use crate::server::core::downloader::SegmentInfo;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::context::{Context, Stage, Worker, WorkerStatus};
+use crate::server::infrastructure::models::InsertFileItem;
 use crate::server::infrastructure::models::hook_step::process_video;
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
-use crate::server::infrastructure::models::InsertFileItem;
-use crate::UploadLine;
 use async_channel::Receiver;
 use biliup::bilibili::{BiliBili, ResponseData, Studio, Video};
 use biliup::client::StatelessClient;
@@ -14,11 +14,11 @@ use biliup::credential::login_by_cookies;
 use biliup::error::Kind;
 use biliup::uploader::line::{Line, Probe};
 use biliup::uploader::util::SubmitOption;
-use biliup::uploader::{line, VideoFile};
+use biliup::uploader::{VideoFile, line};
 use error_stack::ResultExt;
-use futures::stream::Inspect;
 use futures::StreamExt;
 use ormlite::Insert;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Instant;
@@ -41,21 +41,18 @@ struct UploadedVideos {
     paths: Vec<PathBuf>,
 }
 
-pub async fn process_with_upload<F>(
-    rx: Inspect<Receiver<SegmentInfo>, F>,
+pub async fn process_with_upload(
+    rx: Receiver<SegmentInfo>,
     ctx: &Context,
     upload_config: &UploadStreamer,
-) -> AppResult<()>
-where
-    F: FnMut(&SegmentInfo),
-{
+) -> AppResult<()> {
     info!(upload_config=?upload_config, "Starting process with upload");
     // 1. 初始化上传环境
     let upload_context =
         initialize_upload_context(&ctx.config(), &ctx.stateless_client(), upload_config).await?;
 
     // 2. 流水线处理视频上传
-    let uploaded_videos = pipeline_upload_videos(rx, &upload_context).await?;
+    let uploaded_videos = pipeline_upload_videos(rx, &upload_context, ctx).await?;
 
     // 3. 提交到B站
     if !uploaded_videos.videos.is_empty() {
@@ -160,13 +157,47 @@ async fn get_upload_line(client: &reqwest::Client, line: &str) -> AppResult<Line
     Ok(line)
 }
 
-async fn pipeline_upload_videos<F>(
-    rx: Inspect<Receiver<SegmentInfo>, F>,
+async fn insert_file_record(file_path: &Path, ctx: &Context) -> AppResult<()> {
+    let result = InsertFileItem {
+        file: file_path.display().to_string(),
+        streamer_info_id: ctx.id(),
+    }
+    .insert(ctx.pool())
+    .await
+    .change_context(AppError::Unknown)?;
+
+    info!(result=?result, "Insert file");
+    Ok(())
+}
+
+async fn drain_unique_segment_paths(
+    rx: Receiver<SegmentInfo>,
+    ctx: &Context,
+) -> AppResult<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    let mut seen_paths = HashSet::new();
+    pin!(rx);
+    while let Some(event) = rx.next().await {
+        if !seen_paths.insert(event.prev_file_path.clone()) {
+            info!(
+                file = %event.prev_file_path.display(),
+                "Skipping duplicate segment event before postprocess"
+            );
+            continue;
+        }
+
+        insert_file_record(&event.prev_file_path, ctx).await?;
+        paths.push(event.prev_file_path);
+    }
+
+    Ok(paths)
+}
+
+async fn pipeline_upload_videos(
+    rx: Receiver<SegmentInfo>,
     context: &UploadContext,
-) -> AppResult<UploadedVideos>
-where
-    F: FnMut(&SegmentInfo),
-{
+    ctx: &Context,
+) -> AppResult<UploadedVideos> {
     // let mut desc_v2 = Vec::new();
     // for credit in context.upload_config.desc_v2_credit {
     //     desc_v2.push(Credit {
@@ -177,13 +208,33 @@ where
     // }
 
     let mut uploaded = UploadedVideos::default();
+    let mut seen_paths = HashSet::new();
     pin!(rx);
     // 流式处理后续事件
     while let Some(event) = rx.next().await {
-        let video = upload_single_file(&event.prev_file_path, context).await?;
-        uploaded.videos.push(video);
-        uploaded.paths.push(event.prev_file_path);
-        // 失败的文件不加入路径列表，避免后处理出错
+        if !seen_paths.insert(event.prev_file_path.clone()) {
+            info!(
+                file = %event.prev_file_path.display(),
+                "Skipping duplicate segment event before upload"
+            );
+            continue;
+        }
+
+        insert_file_record(&event.prev_file_path, ctx).await?;
+
+        match upload_single_file(&event.prev_file_path, context).await {
+            Ok(video) => {
+                uploaded.videos.push(video);
+                uploaded.paths.push(event.prev_file_path);
+            }
+            Err(e) => {
+                error!(
+                    file = %event.prev_file_path.display(),
+                    error = ?e,
+                    "Upload single file failed, skipping segment"
+                );
+            }
+        }
     }
 
     Ok(uploaded)
@@ -450,31 +501,15 @@ impl UActor {
             UploaderMessage::SegmentEvent(rx, ctx) => {
                 ctx.change_status(Stage::Upload, WorkerStatus::Pending)
                     .await;
-                let inspect = rx.inspect(|f| {
-                    let pool = ctx.pool().clone();
-                    let streamer_info_id = ctx.id();
-                    let file = f.prev_file_path.display().to_string();
-                    tokio::spawn(async move {
-                        let result = InsertFileItem {
-                            file,
-                            streamer_info_id,
-                        }
-                        .insert(&pool)
-                        .await;
-                        info!(result=?result, "Insert file");
-                    });
-                });
                 let result = match ctx.upload_config() {
-                    Some(config) => process_with_upload(inspect, &ctx, config).await,
-                    None => {
-                        let mut paths = Vec::new();
-                        pin!(inspect);
-                        while let Some(event) = inspect.next().await {
-                            paths.push(event.prev_file_path);
+                    Some(config) => process_with_upload(rx, &ctx, config).await,
+                    None => match drain_unique_segment_paths(rx, &ctx).await {
+                        Ok(paths) => {
+                            // 无上传配置时，直接执行后处理
+                            execute_postprocessor(paths, &ctx).await
                         }
-                        // 无上传配置时，直接执行后处理
-                        execute_postprocessor(paths, &ctx).await
-                    }
+                        Err(e) => Err(e),
+                    },
                 };
 
                 if let Err(e) = &result {

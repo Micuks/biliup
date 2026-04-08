@@ -14,6 +14,7 @@ use crate::server::infrastructure::models::hook_step::process;
 use async_channel::{Receiver, Sender};
 use error_stack::{ResultExt, bail};
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,6 +47,7 @@ pub struct SegmentEventProcessor {
     uploader: Sender<UploaderMessage>,
     ctx: Context,
     file_validator: FileValidator,
+    seen_segments: HashSet<PathBuf>,
 }
 
 impl SegmentEventProcessor {
@@ -59,6 +61,7 @@ impl SegmentEventProcessor {
                 true,
             ),
             ctx,
+            seen_segments: HashSet::new(),
         }
     }
 
@@ -66,37 +69,45 @@ impl SegmentEventProcessor {
     pub fn process(&mut self, event: SegmentInfo) -> AppResult<()> {
         // 验证文件有效性
         self.file_validator.validate(&event.prev_file_path)?;
-        match &self.channel {
-            None => {
+        if !self.seen_segments.insert(event.prev_file_path.clone()) {
+            info!(
+                file = %event.prev_file_path.display(),
+                "Skipping duplicate segment event"
+            );
+            return Ok(());
+        }
+
+        if self.channel.as_ref().is_none_or(|tx| tx.is_closed()) {
+            if self.channel.is_some() {
+                info!(
+                    url = self.ctx.live_streamer().url,
+                    "Segment event channel closed, recreating uploader pipeline"
+                );
+            }
+
+            {
                 let (tx, rx) = async_channel::bounded(32); // Use tokio channel for async
 
                 // 发送到上传器
                 let res = self
                     .uploader
-                    .force_send(UploaderMessage::SegmentEvent(rx.clone(), self.ctx.clone()))
+                    .force_send(UploaderMessage::SegmentEvent(rx, self.ctx.clone()))
                     .change_context(AppError::Custom("Failed to send to uploader".to_string()))?;
                 if let Some(prev) = res {
                     warn!(SegmentEvent = ?prev, "replace an existing message in the channel");
                 }
 
-                // 发送到缓冲区
-                let res = tx
-                    .force_send(event)
-                    .change_context(AppError::Custom("Failed to send to buffer".to_string()))?;
-                if let Some(prev) = res {
-                    warn!(SegmentEvent = ?prev, "replace an existing message in the channel");
-                }
                 self.channel = Some(tx);
             }
-            Some(tx) => {
-                // 发送到缓冲区
-                let res = tx
-                    .force_send(event)
-                    .change_context(AppError::Custom("Failed to send to buffer".to_string()))?;
-                if let Some(prev) = res {
-                    warn!(SegmentEvent = ?prev, "replace an existing message in the channel");
-                }
-            }
+        }
+
+        let tx = self.channel.as_ref().expect("segment channel initialized");
+        // 发送到缓冲区
+        let res = tx
+            .force_send(event)
+            .change_context(AppError::Custom("Failed to send to buffer".to_string()))?;
+        if let Some(prev) = res {
+            warn!(SegmentEvent = ?prev, "replace an existing message in the channel");
         }
 
         Ok(())
