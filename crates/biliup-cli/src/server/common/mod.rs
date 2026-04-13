@@ -2,6 +2,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use std::collections::HashMap;
 use std::str::FromStr;
 
+pub mod bili_collection;
 pub mod download;
 pub mod upload;
 /// 通用工具函数

@@ -1,11 +1,14 @@
 use crate::UploadLine;
+use crate::server::common::bili_collection::{
+    submitted_archive_from_response, sync_archives_to_collection,
+};
 use crate::server::common::util::{FileValidator, Recorder};
 use crate::server::config::Config;
 use crate::server::core::downloader::SegmentInfo;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::context::{Context, Stage, Worker, WorkerStatus};
 use crate::server::infrastructure::models::InsertFileItem;
-use crate::server::infrastructure::models::hook_step::process_video;
+use crate::server::infrastructure::models::hook_step::{HookStep, process_video};
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
 use async_channel::Receiver;
 use biliup::bilibili::{BiliBili, ResponseData, Studio, Video};
@@ -55,6 +58,7 @@ pub async fn process_with_upload(
     let uploaded_videos = pipeline_upload_videos(rx, &upload_context, ctx).await?;
 
     // 3. 提交到B站
+    let mut submitted_archives = Vec::new();
     if !uploaded_videos.videos.is_empty() {
         let mut recorder = ctx
             .recorder(ctx.stream_info_ext().streamer_info.clone())
@@ -83,8 +87,20 @@ pub async fn process_with_upload(
                 videos = studio.videos.len(),
                 "Submitting video batch"
             );
-            submit_to_bilibili(&upload_context.bilibili, &studio, submit_api.as_deref()).await?;
+            let response =
+                submit_to_bilibili(&upload_context.bilibili, &studio, submit_api.as_deref()).await?;
+            submitted_archives.push(submitted_archive_from_response(&response, studio.title.clone()));
         }
+    }
+
+    if !submitted_archives.is_empty() {
+        sync_archives_to_collection(
+            ctx,
+            &upload_context.bilibili,
+            upload_config.user_cookie.as_deref(),
+            &submitted_archives,
+        )
+        .await?;
     }
 
     // 4. 执行后处理
@@ -390,8 +406,16 @@ pub(crate) async fn build_studio(
 
 pub async fn execute_postprocessor(video_paths: Vec<PathBuf>, ctx: &Context) -> AppResult<()> {
     if let Some(processor) = &ctx.live_streamer().postprocessor {
+        let processors: Vec<HookStep> = processor
+            .iter()
+            .filter(|step| step.supports_path_execution())
+            .cloned()
+            .collect();
+        if processors.is_empty() {
+            return Ok(());
+        }
         let paths: Vec<&Path> = video_paths.iter().map(|p| p.as_path()).collect();
-        process_video(&paths, processor).await?;
+        process_video(&paths, &processors).await?;
     }
     Ok(())
 }

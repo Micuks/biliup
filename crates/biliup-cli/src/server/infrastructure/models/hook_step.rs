@@ -8,6 +8,45 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::{error, info};
 
+fn default_collection_state_file() -> String {
+    "data/collections_state.json".to_string()
+}
+
+fn default_collection_retry_count() -> u32 {
+    10
+}
+
+fn default_collection_retry_delay_secs() -> u64 {
+    15
+}
+
+fn default_collection_archive_pages() -> u32 {
+    3
+}
+
+#[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
+pub struct BiliCollectionConfig {
+    #[serde(default = "default_collection_state_file")]
+    pub state_file: String,
+    #[serde(default = "default_collection_retry_count")]
+    pub video_info_retries: u32,
+    #[serde(default = "default_collection_retry_delay_secs")]
+    pub video_info_retry_delay_secs: u64,
+    #[serde(default = "default_collection_archive_pages")]
+    pub archive_pages: u32,
+}
+
+impl Default for BiliCollectionConfig {
+    fn default() -> Self {
+        Self {
+            state_file: default_collection_state_file(),
+            video_info_retries: default_collection_retry_count(),
+            video_info_retry_delay_secs: default_collection_retry_delay_secs(),
+            archive_pages: default_collection_archive_pages(),
+        }
+    }
+}
+
 /// 钩子步骤枚举：支持多种操作格式
 /// 既支持 key-value 形式（如 {run: "..."}），也支持纯字符串（如 "rm"）
 #[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
@@ -17,11 +56,27 @@ pub enum HookStep {
     Run { run: String },
     /// 移动文件格式：{mv: "target_dir"}
     Move { mv: String },
+    /// 内建 B 站合集归档：{bili_collection: {...}}
+    BiliCollection {
+        #[serde(default)]
+        bili_collection: BiliCollectionConfig,
+    },
     /// 删除文件格式："rm"
     Remove(String),
 }
 
 impl HookStep {
+    pub fn bili_collection_config(&self) -> Option<&BiliCollectionConfig> {
+        match self {
+            HookStep::BiliCollection { bili_collection } => Some(bili_collection),
+            _ => None,
+        }
+    }
+
+    pub fn supports_path_execution(&self) -> bool {
+        self.bili_collection_config().is_none()
+    }
+
     /// 执行钩子步骤操作
     ///
     /// # 参数
@@ -38,6 +93,12 @@ impl HookStep {
             HookStep::Move { mv } => {
                 // 移动文件到指定目录
                 self.move_file(video_paths, mv).await?;
+            }
+            HookStep::BiliCollection { .. } => {
+                bail!(AppError::Custom(
+                    "bili_collection is a built-in upload postprocessor and cannot run as a standalone shell hook"
+                        .to_string()
+                ));
             }
             HookStep::Remove(cmd) if cmd == "rm" => {
                 // 删除文件
@@ -120,6 +181,11 @@ impl HookStep {
                         status
                     )));
                 }
+            }
+            HookStep::BiliCollection { .. } => {
+                bail!(AppError::Custom(
+                    "bili_collection does not support execute_with".to_string()
+                ));
             }
             cmd => {
                 // 未知命令，返回错误
