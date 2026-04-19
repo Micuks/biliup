@@ -27,7 +27,16 @@ pub async fn download(
     let mut pl = match m3u8_rs::parse_playlist(&bytes) {
         Ok((_i, Playlist::MasterPlaylist(pl))) => {
             info!("Master playlist:\n{:#?}", pl);
-            media_url = media_url.join(&pl.variants[0].uri)?;
+            // Select the variant with the highest bandwidth that has video (resolution).
+            // Falls back to the highest bandwidth overall if none have resolution info.
+            let best = pl.variants.iter()
+                .filter(|v| v.resolution.is_some())
+                .max_by_key(|v| v.bandwidth)
+                .or_else(|| pl.variants.iter().max_by_key(|v| v.bandwidth))
+                .unwrap_or(&pl.variants[0]);
+            info!("Selected variant: bandwidth={}, resolution={:?}, video={:?}",
+                best.bandwidth, best.resolution, best.video);
+            media_url = media_url.join(&best.uri)?;
             info!("media url: {media_url}");
             let resp = client.retryable(media_url.as_str()).await?;
             let bs = resp.bytes().await?;
