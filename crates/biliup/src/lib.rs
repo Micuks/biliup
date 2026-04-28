@@ -61,6 +61,49 @@ where
     }
 }
 
+/// Retry with an explicit, fixed delay schedule (in seconds, with up to ±10% jitter).
+/// Use for rate-limit errors whose cooldown is much longer than the default exponential
+/// schedule's 64s cap (e.g. Bilibili 21566 / 601 which can require hours to clear).
+///
+/// `should_retry` returns true to consume the next slot in `schedule`. Returning false
+/// breaks immediately with the error. After the schedule is exhausted the last error
+/// is returned.
+pub async fn retry_with_schedule<F, Fut, O, E, P>(
+    mut f: F,
+    schedule: &[u64],
+    should_retry: P,
+) -> Result<O, E>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<O, E>>,
+    E: std::fmt::Display,
+    P: Fn(&E) -> bool,
+{
+    let mut idx = 0;
+    loop {
+        match f().await {
+            Err(e) if idx < schedule.len() => {
+                if !should_retry(&e) {
+                    break Err(e);
+                }
+                let base = schedule[idx] as f64;
+                let jitter_factor =
+                    UniformFloat::<f64>::sample_single(-0.1, 0.1, &mut rand::thread_rng());
+                let wait = (base * (1.0 + jitter_factor)).max(1.0);
+                info!(
+                    "Rate-limit retry attempt #{}/{}. Sleeping {:.1}s before the next attempt. {e}",
+                    idx + 1,
+                    schedule.len(),
+                    wait
+                );
+                sleep(Duration::from_secs_f64(wait)).await;
+                idx += 1;
+            }
+            res => break res,
+        }
+    }
+}
+
 trait ReqwestClientBuilderExt {
     fn proxy_builder<U: reqwest::IntoUrl>(proxy: Option<U>) -> reqwest::ClientBuilder;
 }

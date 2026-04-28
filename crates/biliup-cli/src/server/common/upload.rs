@@ -216,16 +216,10 @@ pub async fn submit_to_bilibili(
         _ => SubmitOption::App,
     };
 
-    let result = match submit_option {
-        SubmitOption::BCutAndroid => bilibili
-            .submit_by_bcut_android(studio, None)
-            .await
-            .change_context(AppError::Unknown)?,
-        _ => bilibili
-            .submit_by_app(studio, None)
-            .await
-            .change_context(AppError::Unknown)?,
-    };
+    let result = bilibili
+        .submit_with_retry(studio, &submit_option, None)
+        .await
+        .change_context(AppError::Unknown)?;
     info!("Submit successful");
     Ok(result)
 }
@@ -333,13 +327,25 @@ pub async fn upload(
                 .to_str()
         );
         info!("{line:?}");
-        let video_file = VideoFile::new(video_path).change_context_lazy(|| AppError::Unknown)?;
-        let total_size = video_file.total_size;
-        let file_name = video_file.file_name.clone();
-        let uploader = line
-            .pre_upload(&bilibili, video_file)
-            .await
-            .change_context_lazy(|| AppError::Unknown)?;
+        let total_size = VideoFile::new(video_path)
+            .change_context_lazy(|| AppError::Unknown)?
+            .total_size;
+        let file_name = video_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // pre_upload can hit 601 (上传过快); retry with the long rate-limit schedule.
+        let uploader = biliup::retry_with_schedule(
+            || async {
+                let video_file =
+                    VideoFile::new(video_path).map_err(|e| Kind::Custom(format!("{e}")))?;
+                line.pre_upload(&bilibili, video_file).await
+            },
+            biliup::bilibili::SUBMIT_RATE_LIMIT_BACKOFF,
+            |e: &Kind| matches!(e, Kind::RateLimit { .. }),
+        )
+        .await
+        .change_context_lazy(|| AppError::Unknown)?;
 
         let instant = Instant::now();
 
