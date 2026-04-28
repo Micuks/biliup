@@ -143,20 +143,10 @@ pub async fn upload_by_command(
     cover_up(&mut studio, &bili).await?;
     studio.videos = upload(&video_path, &bili, line, limit).await?;
 
-    match submit {
-        SubmitOption::BCutAndroid => bili
-            .submit_by_bcut_android(&studio, proxy)
-            .await
-            .change_context_lazy(|| AppError::Unknown)?,
-        SubmitOption::Web => bili
-            .submit_by_web(&studio, proxy)
-            .await
-            .change_context_lazy(|| AppError::Unknown)?,
-        _ => bili
-            .submit_by_app(&studio, proxy)
-            .await
-            .change_context_lazy(|| AppError::Unknown)?,
-    };
+    bili
+        .submit_with_retry(&studio, &submit, proxy)
+        .await
+        .change_context_lazy(|| AppError::Unknown)?;
 
     Ok(())
 }
@@ -196,20 +186,10 @@ pub async fn upload_by_config(
         .await?;
         // 命令行参数优先，如果没有提供则使用配置文件中的设置
         let submit_option = submit_override.clone().unwrap_or(config.submit.clone());
-        match submit_option {
-            SubmitOption::BCutAndroid => bilibili
-                .submit_by_bcut_android(&studio, proxy)
-                .await
-                .change_context_lazy(|| AppError::Unknown)?,
-            SubmitOption::Web => bilibili
-                .submit_by_web(&studio, proxy)
-                .await
-                .change_context_lazy(|| AppError::Unknown)?,
-            _ => bilibili
-                .submit_by_app(&studio, proxy)
-                .await
-                .change_context_lazy(|| AppError::Unknown)?,
-        };
+        bilibili
+            .submit_with_retry(&studio, &submit_option, proxy)
+            .await
+            .change_context_lazy(|| AppError::Unknown)?;
     }
     Ok(())
 }
@@ -488,15 +468,15 @@ pub async fn upload(
             let upload_lock_clone = Arc::clone(&upload_lock);
             let lock_acquired_clone = Arc::clone(&lock_acquired);
 
-            biliup::retry_with_config(
+            biliup::retry_with_schedule(
                 || async {
                     let video_file_clone = VideoFile::new(video_path).map_err(|e| {
                         Kind::Custom(format!("file {}: {}", video_path.to_string_lossy(), e))
                     })?;
                     line.pre_upload(bili, video_file_clone).await
                 },
-                5,
-                Some(move |e: &Kind| {
+                biliup::bilibili::SUBMIT_RATE_LIMIT_BACKOFF,
+                move |e: &Kind| {
                     if matches!(e, Kind::RateLimit { .. }) {
                         let mut acquired = lock_acquired_clone.lock().unwrap();
                         if !*acquired {
@@ -524,7 +504,7 @@ pub async fn upload(
                     } else {
                         false
                     }
-                }),
+                },
             )
             .await
             .change_context_lazy(|| AppError::Custom("after retries".to_owned()))?

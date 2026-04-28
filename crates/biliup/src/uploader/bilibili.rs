@@ -13,6 +13,19 @@ use std::str::FromStr;
 use std::time::Duration;
 use tracing::{info, warn};
 
+/// Bilibili submit-side rate-limit codes that warrant a long cooldown retry.
+/// 21566 / 21070 / 21024: 投稿过于频繁  -509: 请求过于频繁
+fn classify_submit_error(ret: &ResponseData) -> Kind {
+    if matches!(ret.code, 21566 | 21070 | 21024 | -509) {
+        Kind::RateLimit {
+            code: ret.code as i64,
+            message: format!("{:?}", ret),
+        }
+    } else {
+        Kind::Custom(format!("{:?}", ret))
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Builder)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 pub struct Studio {
@@ -298,11 +311,45 @@ pub struct BiliBili {
     pub login_info: LoginInfo,
 }
 
+/// Long-cooldown retry schedule (seconds) for Bilibili submit-side rate limits
+/// (21566 / 21070 / 21024 / -509). Total wait across the schedule is ~110 min.
+/// Empirically the 21566 cooldown can run several hours, so we go long-and-few
+/// rather than short-and-many.
+pub const SUBMIT_RATE_LIMIT_BACKOFF: &[u64] = &[300, 900, 1800, 3600];
+
 impl BiliBili {
     #[deprecated(note = "no longer working, fallback to `submit_by_app`")]
     pub async fn submit(&self, studio: &Studio, proxy: Option<&str>) -> Result<ResponseData> {
         warn!("客户端接口已失效, 将使用APP接口");
         self.submit_by_app(studio, proxy).await
+    }
+
+    /// Submit `studio` via the chosen endpoint, retrying with a long cooldown schedule
+    /// when Bilibili returns a known submit-frequency rate-limit code.
+    pub async fn submit_with_retry(
+        &self,
+        studio: &Studio,
+        option: &crate::uploader::util::SubmitOption,
+        proxy: Option<&str>,
+    ) -> Result<ResponseData> {
+        crate::retry_with_schedule(
+            || async {
+                match option {
+                    crate::uploader::util::SubmitOption::BCutAndroid => {
+                        self.submit_by_bcut_android(studio, proxy).await
+                    }
+                    crate::uploader::util::SubmitOption::Web => {
+                        self.submit_by_web(studio, proxy).await
+                    }
+                    crate::uploader::util::SubmitOption::App => {
+                        self.submit_by_app(studio, proxy).await
+                    }
+                }
+            },
+            SUBMIT_RATE_LIMIT_BACKOFF,
+            |e: &Kind| matches!(e, Kind::RateLimit { .. }),
+        )
+        .await
     }
 
     /// 使用必剪接口投稿
@@ -352,7 +399,7 @@ impl BiliBili {
             info!("BCUT接口投稿成功");
             Ok(ret)
         } else {
-            Err(Kind::Custom(format!("{:?}", ret)))
+            Err(classify_submit_error(&ret))
         }
     }
 
@@ -401,7 +448,7 @@ impl BiliBili {
             info!("APP接口投稿成功");
             Ok(ret)
         } else {
-            Err(Kind::Custom(format!("{:?}", ret)))
+            Err(classify_submit_error(&ret))
         }
     }
 
@@ -442,7 +489,7 @@ impl BiliBili {
             info!("Web 接口投稿成功");
             Ok(ret)
         } else {
-            Err(Kind::Custom(format!("{:?}", ret)))
+            Err(classify_submit_error(&ret))
         }
     }
 
