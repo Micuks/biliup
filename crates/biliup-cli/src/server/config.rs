@@ -81,6 +81,12 @@ pub struct Config {
     #[serde(default = "default_pool2_size")]
     pub pool2_size: u32,
 
+    /// 全局投稿最小间隔（秒）：相邻两次 submit 发起至少间隔这么久，跨所有 uploader
+    /// actor 串行限速，压低 B 站 21566（投稿过于频繁）的触发概率。0 = 不限速。
+    #[builder(default = default_submit_min_interval_secs())]
+    #[serde(default = "default_submit_min_interval_secs")]
+    pub submit_min_interval_secs: u64,
+
     // ===== 各平台录播设置 =====
     /// 是否使用直播封面
     #[serde(default)]
@@ -411,6 +417,11 @@ fn default_pool1_size() -> u32 {
 /// 默认连接池2大小：3
 fn default_pool2_size() -> u32 {
     3
+}
+
+/// 默认全局投稿最小间隔：300 秒（5 分钟）
+fn default_submit_min_interval_secs() -> u64 {
+    300
 }
 
 impl Config {

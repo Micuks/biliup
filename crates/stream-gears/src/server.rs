@@ -516,6 +516,10 @@ pub(crate) async fn _main(args: &[String]) -> AppResult<()> {
                 .expect("could not initialize the database connection pool");
 
             *CONFIG.write().unwrap() = repositories::get_config(&conn_pool).await?;
+            // 应用全局投稿限速间隔（B 站 21566 限流缓解）
+            biliup::set_submit_min_interval(std::time::Duration::from_secs(
+                CONFIG.read().unwrap().submit_min_interval_secs,
+            ));
             let download_manager = DownloadManager::new(
                 CONFIG.read().unwrap().pool1_size,
                 CONFIG.read().unwrap().pool2_size,

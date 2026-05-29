@@ -1,7 +1,9 @@
 use futures::Stream;
 use rand::distributions::uniform::{UniformFloat, UniformSampler};
 use std::future::Future;
-use std::time::Duration;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::info;
 pub mod client;
@@ -11,6 +13,40 @@ pub mod uploader;
 
 pub use uploader::bilibili;
 pub use uploader::credential;
+
+/// 全局投稿限速：相邻两次 submit 发起至少间隔这么多毫秒（0 = 不限速）。
+static SUBMIT_MIN_INTERVAL_MS: AtomicU64 = AtomicU64::new(0);
+/// 上一次 submit 发起的时刻，跨所有 uploader actor 共享。
+static SUBMIT_LAST: LazyLock<tokio::sync::Mutex<Option<Instant>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+/// 设置全局投稿最小间隔。server 启动读到 config 后调用一次。
+pub fn set_submit_min_interval(d: Duration) {
+    SUBMIT_MIN_INTERVAL_MS.store(d.as_millis() as u64, Ordering::Relaxed);
+}
+
+/// 投稿限速闸门：在每次真正发 submit 请求前调用。
+///
+/// 持锁 sleep 把多个并发会话的 submit 串成「全局串行 + 最小间隔」，从源头压低
+/// B 站 21566（投稿过于频繁）的触发概率。放在 retry 的「每次尝试」层而非整个
+/// retry 外——这样限流会话 backoff 等待期间闸门是释放的，不会堵住其它会话。
+pub async fn submit_gate() {
+    let ms = SUBMIT_MIN_INTERVAL_MS.load(Ordering::Relaxed);
+    if ms == 0 {
+        return;
+    }
+    let min = Duration::from_millis(ms);
+    let mut last = SUBMIT_LAST.lock().await;
+    if let Some(t) = *last {
+        let elapsed = t.elapsed();
+        if elapsed < min {
+            let wait = min - elapsed;
+            info!("submit gate: pacing {:.1}s before next submit", wait.as_secs_f64());
+            sleep(wait).await;
+        }
+    }
+    *last = Some(Instant::now());
+}
 
 pub async fn retry<F, Fut, O, E: std::fmt::Display>(f: F) -> Result<O, E>
 where
