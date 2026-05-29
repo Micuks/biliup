@@ -334,6 +334,8 @@ impl BiliBili {
     ) -> Result<ResponseData> {
         crate::retry_with_schedule(
             || async {
+                // 全局限速：每次尝试发 submit 前过一次闸门
+                crate::submit_gate().await;
                 match option {
                     crate::uploader::util::SubmitOption::BCutAndroid => {
                         self.submit_by_bcut_android(studio, proxy).await

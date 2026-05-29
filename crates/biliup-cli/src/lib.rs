@@ -51,6 +51,10 @@ pub async fn run(
         repositories::get_config(&conn_pool).await?
     };
 
+    biliup::set_submit_min_interval(std::time::Duration::from_secs(
+        loaded_config.submit_min_interval_secs,
+    ));
+
     let config = Arc::new(RwLock::new(loaded_config));
     let download_manager = DownloadManager::new(
         config.read().unwrap().pool1_size,
