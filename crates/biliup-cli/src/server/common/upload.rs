@@ -38,7 +38,11 @@ struct UploadContext {
 #[derive(Default)]
 struct UploadedVideos {
     videos: Vec<Video>,
+    /// 实际上传成功的产物路径（remux 后为 .mp4，否则为原始路径）。
     paths: Vec<PathBuf>,
+    /// 因 segment_processor（如 remux）就地替换而失去引用的源文件（如源 .ts）。
+    /// 仅在「对应段上传成功」时收集；上传/remux 失败的段绝不进入此列表。
+    source_paths: Vec<PathBuf>,
 }
 
 pub async fn process_with_upload<F>(
@@ -79,9 +83,16 @@ where
         submit_to_bilibili(&upload_context.bilibili, &studio, submit_api.as_deref()).await?;
     }
 
-    // 4. 执行后处理
-    if !uploaded_videos.paths.is_empty() {
-        execute_postprocessor(uploaded_videos.paths, ctx).await?;
+    // 4. 执行后处理（清理）。
+    //    只有在 submit 成功（上面没有早返）时才会到这里 —— 此处统一回收：
+    //      - 上传产物 paths（remux 后的 .mp4 或原始上传文件）
+    //      - 被 remux 就地替换、已失去引用的源文件 source_paths（如源 .ts）
+    //    两者都只来自「上传成功」的段，因此 postprocessor 的 `rm` 不会误删
+    //    任何未成功上传的文件。
+    let mut cleanup_paths = uploaded_videos.paths;
+    cleanup_paths.extend(uploaded_videos.source_paths);
+    if !cleanup_paths.is_empty() {
+        execute_postprocessor(cleanup_paths, ctx).await?;
     }
 
     Ok(())
@@ -165,14 +176,22 @@ where
         // 否则已成功上传的段也无法到达 submit + postprocessor，本地 `rm` 不触发，
         // 文件越堆越多，磁盘进一步紧张，形成正反馈。
         let mut paths = segment_paths(&event);
-        if !segment_processors.is_empty()
-            && let Err(e) = process_video_paths(&mut paths, segment_processors).await
-        {
-            error!(
-                file = ?event.prev_file_path,
-                "segment_processor failed, skipping segment: {:?}", e
-            );
-            continue;
+        // displaced = 被 remux 等就地替换后失去引用的源文件（如源 .ts）。
+        // 仅当本段最终上传成功，才会把它排入清理队列。
+        let mut displaced: Vec<PathBuf> = Vec::new();
+        if !segment_processors.is_empty() {
+            match process_video_paths(&mut paths, segment_processors).await {
+                Ok(d) => displaced = d,
+                Err(e) => {
+                    // remux 失败：源 .ts 原样保留（ffmpeg_remux_to_mp4 已清半成品），
+                    // displaced 为空 → 不会被删 → 可重试。跳过本段，不拖死整批。
+                    error!(
+                        file = ?event.prev_file_path,
+                        "segment_processor failed, skipping segment: {:?}", e
+                    );
+                    continue;
+                }
+            }
         }
         let upload_path = paths
             .first()
@@ -185,8 +204,12 @@ where
                 // 继续接收本段视频路径和对应弹幕路径。segment_processor 可能已把
                 // 首个视频路径原地替换（例如 Remux .ts→.mp4），因此这里保留转换后的路径集。
                 uploaded.paths.extend(paths);
+                // 本段上传成功 → 其源 .ts 现在可以被回收（待 submit 成功后）。
+                uploaded.source_paths.extend(displaced);
             }
             Err(e) => {
+                // 上传失败：源 .ts 不入 source_paths → 保留供后续重试/人工处理。
+                // 产物 .mp4 成为孤儿（可后续 gc），但绝不误删源文件。
                 error!(
                     file = ?upload_path,
                     "upload_single_file failed, skipping segment: {:?}", e

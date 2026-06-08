@@ -74,7 +74,16 @@ impl HookStep {
 
     /// Path-mutating variant: lets steps swap entries in the working set
     /// (e.g. Remux replaces .ts with the newly-created .mp4).
-    pub async fn execute_paths(&self, video_paths: &mut Vec<PathBuf>) -> AppResult<()> {
+    ///
+    /// Any path that is REPLACED by a different path (e.g. the source .ts
+    /// supplanted by a remuxed .mp4) is pushed into `displaced` so the caller
+    /// can reclaim the now-unreferenced source file later — but only after the
+    /// whole segment (upload + submit) has succeeded.
+    pub async fn execute_paths(
+        &self,
+        video_paths: &mut Vec<PathBuf>,
+        displaced: &mut Vec<PathBuf>,
+    ) -> AppResult<()> {
         match self {
             HookStep::Remux { remux } => {
                 let target = remux.to_lowercase();
@@ -102,10 +111,18 @@ impl HookStep {
                             .unwrap_or(false)
                     {
                         info!("remux: reusing existing {}", mp4.display());
+                        if *p != mp4 {
+                            displaced.push(p.clone());
+                        }
                         *p = mp4;
                         continue;
                     }
+                    // ffmpeg_remux_to_mp4 已保证：失败时删除半成品 mp4 且返回 Err。
+                    // 此时我们尚未把源 .ts 推进 displaced，源文件原样保留可重试。
                     Self::ffmpeg_remux_to_mp4(p, &mp4).await?;
+                    if *p != mp4 {
+                        displaced.push(p.clone());
+                    }
                     *p = mp4;
                 }
             }
@@ -415,13 +432,14 @@ pub async fn process_video(video_path: &[&Path], processors: &[HookStep]) -> App
 pub async fn process_video_paths(
     video_paths: &mut Vec<PathBuf>,
     processors: &[HookStep],
-) -> AppResult<()> {
+) -> AppResult<Vec<PathBuf>> {
     info!("Starting video processing (path-mutating)...");
+    let mut displaced: Vec<PathBuf> = Vec::new();
     for processor in processors {
-        processor.execute_paths(video_paths).await?;
+        processor.execute_paths(video_paths, &mut displaced).await?;
     }
     info!("Video processing completed");
-    Ok(())
+    Ok(displaced)
 }
 
 #[cfg(test)]
@@ -466,9 +484,11 @@ mod tests {
         let step = HookStep::Remux {
             remux: "mp4".into(),
         };
-        step.execute_paths(&mut paths).await.unwrap();
-        // Already .mp4 → unchanged.
+        let mut displaced: Vec<PathBuf> = Vec::new();
+        step.execute_paths(&mut paths, &mut displaced).await.unwrap();
+        // Already .mp4 → unchanged, nothing displaced.
         assert_eq!(paths[0], p);
+        assert!(displaced.is_empty());
     }
 
     #[tokio::test]
@@ -522,11 +542,14 @@ mod tests {
         let step = HookStep::Remux {
             remux: "mp4".into(),
         };
-        let result = step.execute_paths(&mut paths).await;
+        let mut displaced: Vec<PathBuf> = Vec::new();
+        let result = step.execute_paths(&mut paths, &mut displaced).await;
         assert!(
             result.is_err(),
             "ffmpeg 读不到输入应返回 Err，调用方才能在 pipeline 里做 log+continue"
         );
+        // 失败时绝不把源 .ts 计入 displaced（否则会被误删，破坏重试幂等）。
+        assert!(displaced.is_empty());
         // 失败时不要把破损的 mp4 留在磁盘上（idempotent retry 前提）
         assert!(!bogus.with_extension("mp4").exists());
     }
