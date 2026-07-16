@@ -41,6 +41,18 @@ pub async fn run(addr: (&str, u16), auth: bool, log_handle: LogHandle) -> AppRes
     let service_register =
         ServiceRegister::new(conn_pool, config.clone(), download_manager, log_handle);
 
+    // 启动时恢复被中断的录制会话(收尾孤儿 .part + 把待上传会话重放进 UActor)。
+    // best-effort:任何失败只记录日志,不阻塞 server 启动。
+    {
+        let pool = service_register.pool.clone();
+        let cfg = service_register.config.clone();
+        let client = service_register.client.clone();
+        let up_tx = service_register.managers.up_sender.clone();
+        tokio::spawn(async move {
+            crate::server::common::recovery::recover_pending_uploads(pool, cfg, client, up_tx).await;
+        });
+    }
+
     tracing::info!("migrations successfully ran, initializing axum server...");
     let addr = addr
         .to_socket_addrs()

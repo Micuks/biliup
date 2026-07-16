@@ -1,5 +1,5 @@
 use crate::server::common::download::{DActor, DownloaderMessage};
-use crate::server::common::upload::UActor;
+use crate::server::common::upload::{UActor, UploaderMessage};
 use crate::server::core::monitor::Monitor;
 use crate::server::core::plugin::DownloadPlugin;
 use crate::server::infrastructure::connection_pool::ConnectionPool;
@@ -22,6 +22,8 @@ pub struct DownloadManager {
     update_semaphore: u32,
     /// 下载消息发送器
     pub down_sender: Sender<DownloaderMessage>,
+    /// 上传消息发送器(供启动恢复注入 SegmentEvent)
+    pub up_sender: Sender<UploaderMessage>,
     /// 下载Actor任务句柄列表
     pub(crate) d_kills: Vec<JoinHandle<()>>,
     /// 上传Actor任务句柄列表
@@ -55,23 +57,11 @@ impl DownloadManager {
             u_kills.push(u_kill)
         }
 
-        // 启动时恢复被中断的录制会话(收尾孤儿 .part + 扫描 filelist 待传候选)。
-        // best-effort:内部只记录日志,绝不阻塞 server 启动。
-        {
-            let pool = pool.clone();
-            tokio::spawn(async move {
-                crate::server::common::recovery::recover_pending_uploads(
-                    &pool,
-                    std::path::Path::new("."),
-                )
-                .await;
-            });
-        }
-
         Self {
             download_semaphore,
             update_semaphore,
             down_sender: down_tx,
+            up_sender: up_tx,
             d_kills,
             u_kills,
             rooms_handle,
