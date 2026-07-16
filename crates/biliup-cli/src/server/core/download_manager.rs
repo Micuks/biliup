@@ -55,6 +55,19 @@ impl DownloadManager {
             u_kills.push(u_kill)
         }
 
+        // 启动时恢复被中断的录制会话(收尾孤儿 .part + 扫描 filelist 待传候选)。
+        // best-effort:内部只记录日志,绝不阻塞 server 启动。
+        {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                crate::server::common::recovery::recover_pending_uploads(
+                    &pool,
+                    std::path::Path::new("."),
+                )
+                .await;
+            });
+        }
+
         Self {
             download_semaphore,
             update_semaphore,
