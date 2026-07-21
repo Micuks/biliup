@@ -1,5 +1,5 @@
 use crate::server::common::download::{DActor, DownloaderMessage};
-use crate::server::common::upload::UActor;
+use crate::server::common::upload::{UActor, UploaderMessage};
 use crate::server::core::monitor::Monitor;
 use crate::server::core::plugin::DownloadPlugin;
 use crate::server::infrastructure::connection_pool::ConnectionPool;
@@ -22,6 +22,8 @@ pub struct DownloadManager {
     update_semaphore: u32,
     /// 下载消息发送器
     pub down_sender: Sender<DownloaderMessage>,
+    /// 上传消息发送器(供启动恢复注入 SegmentEvent)
+    pub up_sender: Sender<UploaderMessage>,
     /// 下载Actor任务句柄列表
     pub(crate) d_kills: Vec<JoinHandle<()>>,
     /// 上传Actor任务句柄列表
@@ -59,6 +61,7 @@ impl DownloadManager {
             download_semaphore,
             update_semaphore,
             down_sender: down_tx,
+            up_sender: up_tx,
             d_kills,
             u_kills,
             rooms_handle,
