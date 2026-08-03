@@ -485,10 +485,35 @@ mod tests {
             remux: "mp4".into(),
         };
         let mut displaced: Vec<PathBuf> = Vec::new();
-        step.execute_paths(&mut paths, &mut displaced).await.unwrap();
+        step.execute_paths(&mut paths, &mut displaced)
+            .await
+            .unwrap();
         // Already .mp4 → unchanged, nothing displaced.
         assert_eq!(paths[0], p);
         assert!(displaced.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remux_reuses_mp4_and_tracks_only_displaced_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("segment.ts");
+        let remuxed = dir.path().join("segment.mp4");
+        let danmaku = dir.path().join("segment.xml");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&remuxed, b"remuxed").unwrap();
+        std::fs::write(&danmaku, b"danmaku").unwrap();
+        let mut paths = vec![source.clone(), danmaku.clone()];
+        let mut displaced = Vec::new();
+        let step = HookStep::Remux {
+            remux: "mp4".into(),
+        };
+
+        step.execute_paths(&mut paths, &mut displaced)
+            .await
+            .unwrap();
+
+        assert_eq!(paths, vec![remuxed, danmaku]);
+        assert_eq!(displaced, vec![source]);
     }
 
     #[tokio::test]

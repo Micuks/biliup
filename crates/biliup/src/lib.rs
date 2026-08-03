@@ -41,7 +41,10 @@ pub async fn submit_gate() {
         let elapsed = t.elapsed();
         if elapsed < min {
             let wait = min - elapsed;
-            info!("submit gate: pacing {:.1}s before next submit", wait.as_secs_f64());
+            info!(
+                "submit gate: pacing {:.1}s before next submit",
+                wait.as_secs_f64()
+            );
             sleep(wait).await;
         }
     }

@@ -143,8 +143,7 @@ pub async fn upload_by_command(
     cover_up(&mut studio, &bili).await?;
     studio.videos = upload(&video_path, &bili, line, limit).await?;
 
-    bili
-        .submit_with_retry(&studio, &submit, proxy)
+    bili.submit_with_retry(&studio, &submit, proxy)
         .await
         .change_context_lazy(|| AppError::Unknown)?;
 
