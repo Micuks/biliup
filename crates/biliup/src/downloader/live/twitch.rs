@@ -99,6 +99,7 @@ struct TwitchLive {
     re: Regex,
     twitch_danmaku: bool,
     twitch_disable_ads: bool,
+    twitch_max_height: Option<u32>,
     twitch_auth_token: Option<String>,
 }
 
@@ -112,6 +113,7 @@ impl TwitchLive {
             re,
             twitch_danmaku: options.danmaku,
             twitch_disable_ads: options.disable_ads,
+            twitch_max_height: options.max_height,
             twitch_auth_token: request.credentials.twitch_cookie,
         }
     }
@@ -176,6 +178,12 @@ impl TwitchLive {
             ])
             .map_err(|err| LiveError::custom(format!("构造 Twitch HLS 参数失败: {err}")))?
         );
+        // 限制了最高分辨率时，直接把对应档位的 media playlist 交给下载器，
+        // 绕过下载器"取最高码率"的选流逻辑。
+        let raw_stream_url = match self.twitch_max_height {
+            Some(max_height) => self.capped_variant_url(&raw_stream_url, max_height).await,
+            None => raw_stream_url,
+        };
 
         Ok(LiveStatus::Live {
             stream: Box::new(LiveStream {
@@ -199,6 +207,39 @@ impl TwitchLive {
                 })),
             }),
         })
+    }
+
+    /// 选出不超过 `max_height` 的最高码率档位；任何失败都回退到原始 master playlist。
+    async fn capped_variant_url(&self, master_url: &str, max_height: u32) -> String {
+        let bytes = match self
+            .client
+            .get(master_url)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+        {
+            Ok(resp) => match resp.bytes().await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::warn!("读取 Twitch master playlist 失败，回退最高画质: {err}");
+                    return master_url.to_string();
+                }
+            },
+            Err(err) => {
+                tracing::warn!("请求 Twitch master playlist 失败，回退最高画质: {err}");
+                return master_url.to_string();
+            }
+        };
+        match select_capped_variant(master_url, &bytes, max_height) {
+            Some(url) => {
+                tracing::info!("Twitch 限制分辨率 <= {max_height}p: {}", self.name);
+                url
+            }
+            None => {
+                tracing::warn!("未找到 <= {max_height}p 的 Twitch 档位，回退最高画质");
+                master_url.to_string()
+            }
+        }
     }
 
     fn channel_name(&self, url: &str) -> LiveResult<String> {
@@ -499,6 +540,29 @@ struct PlaybackAccessToken {
     value: String,
 }
 
+/// 从 master playlist 中选出高度不超过 `max_height` 的最高码率档位，返回其绝对地址。
+fn select_capped_variant(master_url: &str, bytes: &[u8], max_height: u32) -> Option<String> {
+    let Ok((_, m3u8_rs::Playlist::MasterPlaylist(pl))) = m3u8_rs::parse_playlist(bytes) else {
+        return None;
+    };
+    let best = pl
+        .variants
+        .iter()
+        .filter(|v| {
+            !v.is_i_frame
+                && v
+                    .resolution
+                    .as_ref()
+                    .is_some_and(|r| r.height <= u64::from(max_height))
+        })
+        .max_by_key(|v| v.bandwidth)?;
+    url::Url::parse(master_url)
+        .ok()?
+        .join(&best.uri)
+        .ok()
+        .map(String::from)
+}
+
 fn gql_headers(auth_token: Option<&str>) -> LiveResult<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -534,4 +598,39 @@ fn string_field(entry: &Value, keys: &[&str]) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_capped_variant;
+
+    const MASTER: &str = "https://usher.ttvnw.net/api/channel/hls/foo.m3u8?sig=x";
+    const PLAYLIST: &[u8] = b"#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=160000,CODECS=\"mp4a.40.2\",VIDEO=\"audio_only\"
+https://cdn.example/audio_only.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=6928730,RESOLUTION=1920x1080,CODECS=\"avc1.4D402A,mp4a.40.2\",VIDEO=\"chunked\",FRAME-RATE=60.000
+https://cdn.example/chunked.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3422999,RESOLUTION=1280x720,CODECS=\"avc1.4D401F,mp4a.40.2\",VIDEO=\"720p60\",FRAME-RATE=60.000
+https://cdn.example/720p60.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1427999,RESOLUTION=852x480,CODECS=\"avc1.4D401F,mp4a.40.2\",VIDEO=\"480p30\",FRAME-RATE=30.000
+https://cdn.example/480p30.m3u8
+";
+
+    #[test]
+    fn picks_best_variant_under_cap() {
+        assert_eq!(
+            select_capped_variant(MASTER, PLAYLIST, 720).as_deref(),
+            Some("https://cdn.example/720p60.m3u8")
+        );
+        assert_eq!(
+            select_capped_variant(MASTER, PLAYLIST, 1080).as_deref(),
+            Some("https://cdn.example/chunked.m3u8")
+        );
+    }
+
+    #[test]
+    fn returns_none_when_nothing_fits() {
+        assert_eq!(select_capped_variant(MASTER, PLAYLIST, 360), None);
+        assert_eq!(select_capped_variant(MASTER, b"not a playlist", 720), None);
+    }
 }

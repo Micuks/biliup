@@ -107,6 +107,7 @@ fn live_options(config: &Config) -> LiveOptions {
         twitch: TwitchOptions {
             danmaku: config.twitch_danmaku.unwrap_or(false),
             disable_ads: config.twitch_disable_ads.unwrap_or(true),
+            max_height: config.twitch_max_height,
         },
         youtube: YoutubeOptions {
             enable_download_live: config.youtube_enable_download_live.unwrap_or(true),

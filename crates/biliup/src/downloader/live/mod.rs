@@ -239,6 +239,7 @@ pub struct TwitcastingOptions {
 pub struct TwitchOptions {
     pub danmaku: bool,
     pub disable_ads: bool,
+    pub max_height: Option<u32>,
 }
 
 impl Default for TwitchOptions {
@@ -246,6 +247,7 @@ impl Default for TwitchOptions {
         Self {
             danmaku: false,
             disable_ads: true,
+            max_height: None,
         }
     }
 }

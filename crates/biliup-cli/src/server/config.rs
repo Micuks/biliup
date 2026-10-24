@@ -244,6 +244,9 @@ pub struct Config {
     /// Twitch禁用广告
     #[serde(default)]
     pub twitch_disable_ads: Option<bool>,
+    /// Twitch最高录制分辨率高度（如 720），为空则录制最高画质
+    #[serde(default)]
+    pub twitch_max_height: Option<u32>,
 
     // TwitCasting平台设置
     /// TwitCasting弹幕录制
@@ -619,5 +622,15 @@ mod tests {
         assert_eq!(config.file_size, None);
         assert_eq!(config.segment_time, Some("01:00:00".to_string()));
         assert!(config.validate_segment_limits().is_ok());
+    }
+
+    #[test]
+    fn config_patch_sets_twitch_max_height() {
+        let mut config = Config::default();
+        let patch: ConfigPatch = serde_json::from_str(r#"{"twitch_max_height": 720}"#).unwrap();
+
+        config.apply(patch);
+
+        assert_eq!(config.twitch_max_height, Some(720));
     }
 }
